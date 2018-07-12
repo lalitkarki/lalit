@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+import sys
+import time
+import os
+import queue
+import threading
+import imaplib
+import re
+import configparser 
+import ast
+import smtplib
+import email.utils
+import email
+import email.parser
+from email.mime.text import MIMEText
+import datetime
+import string
+import logging
+
+from watchdog.observers import Observer
+from watchdog.events import LoggingEventHandler, FileSystemEventHandler
+
+#mail template for mail
+mail_template = string.Template('$mail_content\n\n with regards, \n Mail Admin')
+
+class Context:
+    """
+    class for creating imap and smtp connection
+    """
+    def __init__(self, config):
+        self.config = config
+        self.imap_connection = None
+        self.smtp_connection = None
+
+    def create_imap_connection(self, host, port, username, password):
+        """
+        **Type:** Public.
+
+        **Arguments:**
+            - host: ip address of imap server.
+            - port: port number of imap server.
+
+        **Returns:** IMAP connection object.
+
+        **Raises:** Nothing
+
+        This methods create imap_connection.
+
+        Following steps are performed in this method:
+            -Attempts are made to connect to IMAP server until connection is 
+             established.
+            -User is logged into the server using username and password.
+        """
+        while True:
+            try:
+                imap_connection = imaplib.IMAP4_SSL(host=host, port=port)
+                logging.info("IMAP connection has been established.")
+                break
+            except imaplib.IMAP4.error as imap_error:
+                logging.error(imap_error)
+                time.sleep(5)
+
+        try:
+            imap_connection.login(username, password)
+            logging.info("{0} is logged in host {1} with port {2}".format(username, host, port))
+            return imap_connection
+        except imaplib.IMAP4.error as imap_error:
+            logging.error(imap_error)
+            print("Authentication Failed for IMAP server")
+            sys.exit()
+
+    def get_imap_connection(self):
+        """
+        **Type:** Public.
+
+        **Arguments:** None.
+
+        **Returns:** IMAP connection object.
+
+        **Raises:** Nothing
+
+        This methods returns imap_connection object.
+
+        Following steps are performed in this method:
+            -check if connection is alive with the server using noop.
+            -if connection is alive return imap connection object else reconnect
+             to the server and return connection object.
+        """
+        try:
+            self.imap_connection.noop()
+        except (AttributeError, imaplib.IMAP4.error):
+            try:
+                self.imap_connection = self.create_imap_connection(self.config.get('mailmove', 'imap_host'),
+                                              self.config.get('mailmove', 'imap_port'),
+                                              self.config.get('mailmove', 'imap_username'),
+                                              self.config.get('mailmove', 'imap_password'))
+            except configparser.NoSectionError as no_section_error:
+                logging.error(no_section_error)
+                sys.exit()
+            except configparser.NoOptionError as no_option_error:
+                logging.error(no_option_error)
+                sys.exit()
+        return self.imap_connection
+
+    def create_smtp_connection(self, host, port, username, password):
+        """
+        **Type:** Public.
+
+        **Arguments:**
+            - host: ip address of imap server.
+            - port: port number of imap server.
+            - username: credential to login into server.
+            - password: credential to login into server.
+
+        **Returns:** SMTP connection object.
+
+        **Raises:** Nothing
+
+        This methods create smtp_connection.
+
+        Following steps are performed in this method:
+            - Attempts are made to connect to SMTP server until connection is 
+              established.
+            - User is logged into the server using username and password.
+        """
+
+        while True:
+            try:
+                smtp_connection = smtplib.SMTP(host=host, port=port)
+                smtp_connection.starttls()
+                logging.info("SMTP connection has been established.")
+                break
+            except smtplib.SMTPException as smtp_error:
+                logging.error(smtp_error)
+                time.sleep(5)
+        try:
+            smtp_connection.login(username, password)
+            logging.info("{0} is logged in host {1} with port {2}".format(username, host, port))
+            return smtp_connection
+        except smtplib.SMTPAuthenticationError as authentication_error:
+            logging.error(authentication_error)
+            print("Authentication failed for SMTP server")
+            sys.exit()
+        except smtplib.SMTPException as smtp_error:
+            logging.error(smtp_error)
+            sys.exit()
+
+    def get_smtp_connection(self):
+        """
+        **Type:** Public.
+
+        **Arguments:** None.
+
+        **Returns:** SMTP connection object.
+
+        **Raises:** Nothing
+
+        This methods returns smtp_connection object.
+
+        Following steps are performed in this method:
+            -check if connection is alive with the server using noop.
+            -if connection is alive return smtp connection object else reconnect
+             to the server and return connection object.
+        """
+        try:
+            self.smtp_connection.noop()
+        except (AttributeError, smtplib.SMTPException):
+            try:
+                self.smtp_connection = self.create_smtp_connection(host=self.config.get('mailmove','smtp_host'),
+                                              port=self.config.get('mailmove','smtp_port'),
+                                              username=self.config.get('mailmove','smtp_username'),
+                                              password=self.config.get('mailmove','smtp_password'))
+            except configparser.NoOptionError as no_option_error:
+                logging.error(no_option_error)
+                sys.exit()
+            except configparser.NoSectionError as no_section_error:
+                logging.error(no_section_error)
+                sys.exit()
+        return self.smtp_connection
+
+def get_named_group_from_regex(compiled_regex, sentence):
+    """
+
+    **Arguments:**
+        -regex : regular expresssion pattern string.
+        -sentence : string to be compared with regex.
+
+    **Returns:** dictionary of named_group.
+
+    **Raises:** Nothing
+
+    This methods returns dictionary of named_group.
+
+    """
+    for m in compiled_regex.finditer(sentence):
+        return m.groupdict()
+
+def match_regex(compiled_regex, sentence):
+    """
+    **Type:** Public.
+
+    **Arguments:** None.
+
+    **Returns:** None or object of class _sre.SRE.
+
+    **Raises:** Nothing
+
+    This methods match the regular expression with sentence.
+
+    """
+    return compiled_regex.match(sentence)
+
+def parse_mail_to_dict(imap_connection, msg_id):
+    """
+    **Type:** Public.
+
+    **Arguments:**
+        imap_connection : imap_connection object.
+        msg_id: message id of mail.
+
+    **Returns:** dictionary of mail data .
+
+    **Raises:** Nothing
+
+    This method parses mail data(header and body) into a dictionary.
+
+    """
+    typ, msg_data = imap_connection.fetch(msg_id, '(RFC822)')
+    for response_part in msg_data:
+        if isinstance(response_part, tuple):
+            email_parser = email.parser.BytesFeedParser()
+            email_parser.feed(response_part[1])
+            msg = email_parser.close()
+    return msg
+
+def mailmove(parameter_dict):
+    """
+    **Type:** Public.
+
+    **Arguments:**
+        -parameter_dict : dictionary containing 'sender', 'day', 'month' as keys. 
+
+    **Returns:** None
+
+    **Raises:** Nothing
+
+    This method move mails from source folder to destination folder.It sends mail to 
+    sender and receivers of the mail stating the reason for mail not been delivered.
+
+    Following steps are performed in this method:
+        -fetch mail_size, source_folder, destination_folder from configuration file.
+        -filter mails using mail_size, date, and sender.Move this mail from source
+         folder to destination folder.
+        -prepare a dictionary with keys as senders and receivers and values as 
+         empty dictionary.Populate the senders value with key value pair of 
+         sender's mail_id and mail content for sender.Populate the receivers value with key 
+         value pair of receiver's mail id and mail content for receiver.
+        -send mail to both the sender and receivers.
+    """
+    mailing_dict = {'senders':{}, 'receivers':{}}
+    date_filter = '{}-{}-{}'.format(parameter_dict['day'], parameter_dict['month'],
+                                    datetime.datetime.now().year)
+    try:
+        mail_size = config.get('global', 'mail_size')
+        source_folder = config.get('mailmove', 'source_folder')
+        destination_folder = config.get('mailmove', 'destination_folder')
+    except configparser.NoOptionError as no_option_error:
+        logging.error(option_error)
+        sys.exit()
+    except configparser.NoSectionError as no_section_error:
+        logging.error(no_section_error)
+        sys.exit()
+    sender = parameter_dict['sender']
+    imap_connection = context.get_imap_connection()
+    logging.debug("imap connection object is fetched")
+    imap_connection.select(source_folder)
+    logging.debug("{0} is selected as source folder".format(source_folder))
+ 
+    typ, [response] = imap_connection.search(None,'LARGER {0} FROM {1} SINCE {2}'
+                                        .format(mail_size, sender, date_filter))
+    if response.decode('utf-8').strip():
+        for msg_id in response.decode('utf-8').split(' '):
+            msg = parse_mail_to_dict(imap_connection, msg_id)
+            mail_for_sender = config.get('mailmove','mail_body_for_sender').format(from_address=msg['From'],
+                    send_date = msg['Date'],
+                    recipient_address = msg['To'], subject = msg['subject'])
+            mail_for_receiver = config.get('mailmove','mail_body_for_receiver').format(from_address=msg['From'],
+                       send_date=msg['Date'], recipient_address=msg['To'], subject=config.get('mailmove','mail_subject'))
+            if not mailing_dict.get('senders').get(msg['From']):
+                mailing_dict['senders'][msg['From']] = [mail_for_sender]
+            else:
+                mailing_dict['senders'][msg['From']].append(mail_for_sender)
+            if not mailing_dict.get('receivers').get(msg['To']):
+                mailing_dict['receivers'][msg['To']] = [mail_for_receiver]
+            else:
+                mailing_dict['receivers'][msg['To']].append(mail_for_receiver)
+        send_mail(mailing_dict['receivers'], context.get_smtp_connection())
+        logging.info("mail is send to all the recievers")
+        send_mail(mailing_dict['senders'], context.get_smtp_connection())
+        logging.info("mail is send to sender")
+        msg_ids = ','.join(response.decode('utf-8').split(' '))
+        imap_connection.copy(msg_ids, destination_folder)
+        logging.info("messages are copied from {0} to {1}".format(source_folder, destination_folder))
+        typ, response = imap_connection.store(msg_ids, '+FLAGS', r'(\Deleted)')
+        imap_connection.expunge()
+
+def send_mail(mailing_details_dict, smtp_connection):
+    """
+    **Type:** Public.
+
+    **Arguments:**
+        stmp_connection : smtp connection object.
+        mailing_details_dict : dictionary with key as email id and value as 
+        mail content.
+
+    **Returns:** Nothing.
+
+    **Raises:** Nothing
+
+    This method send mail.
+    
+    Following steps are performed in this method:
+    -check if connection is alive with the server using noop.
+    -if connection is alive return smtp connection object else reconnect
+     to the server and return connection object.
+    """
+    for email_id, content in mailing_details_dict.items():
+        msg = MIMEText(mail_template.safe_substitute({'mail_content': '\n\n'.join(content)}))
+        msg['To'] = email.utils.formataddr(('Recipient', email_id))
+        msg['From'] = email.utils.formataddr((None, config.get('mailmove', 'smtp_mail_sender')))
+        msg['Date'] = email.utils.formatdate(localtime=True)
+        msg['Message-ID'] = email.utils.make_msgid(domain='paramatrix.com')
+        try:
+            msg['Subject'] = config.get('mailmove', 'mail_subject')
+        except configparser.NoOptionError as no_option_error:
+            logging.error(no_option_error)
+        except configparser.NoSectionError as no_section_error:
+            logging.error(no_section_error)
+        try:
+            smtp_connection.sendmail(config.get('mailmove', 'smtp_mail_sender'), email_id, msg.as_string())
+            logging.info("mail is sent to {0}".format(email_id))
+        except smtplib.SMTPException as smtp_exception:
+            logging.error(smtp_exception)
+            sys.exit()
+
+#dictionary with key as name of method and value as method object.
+action_dict = {"mailmove":mailmove}
+
+def process_mail_log(regex_callbacks_dict):
+    """
+    **Type:** Public.
+
+    **Arguments:**
+        -regex_callbacks_dict : dictionary containing key as compiled regex object
+        and value as function name as string. 
+
+    **Returns:** None
+
+    **Raises:** Nothing
+
+    This method move mails from source folder to destination folder.It sends mail to 
+    sender and receivers of the mail stating the reason for mail not been delivered.
+
+    Following steps are performed in this method:
+        -fetches log entry from queue.
+        -match log entry with the regex if regex is matched then get all the 
+         required parameters from log. Call the corresponding 
+         function present as  value to the key regex and pass the paramaters to it.
+    """
+    while True:
+        mail_log = mail_log_queue.get()
+        logging.debug("{0} is fetched from queue".format(mail_log))
+        for compiled_regex, method in regex_callbacks_dict.items():
+            if match_regex(compiled_regex, mail_log):
+                logging.debug("regex is matched with {0}".format(mail_log))
+                action_dict[method](get_named_group_from_regex(compiled_regex, mail_log))
+                break
+            logging.debug("regex is not matched with {0}".format(mail_log))
+
+class EventHandlerMailLog(FileSystemEventHandler):
+
+    def __init__(self, file):
+        self.file_path = file
+        self.file = open(file)
+        self.file.read()
+
+    def on_modified(self, event):
+        """
+        Type: Public.
+
+        Arguments:
+            - event: object of FileModifiedEvent Class
+
+        Return: None.
+
+        Raise: None.
+
+        This method performs following steps.
+            - if source path of the modified file is same as source path of the 
+              provided file then put the newly appended lines in a queue.
+        """
+        if event.src_path == self.file_path:
+            for line in self.file.readlines():
+                mail_log_queue.put(line)
+                logging.debug("{0} is pushed into queue".format(line))
+
+if __name__ == "__main__":
+    if len(sys.argv) == 1:
+        print("Configuration file should be provided as argument.")
+        sys.exit()
+    if not os.path.isfile(sys.argv[1]):
+        print("file provided in argument does not exist.")
+        sys.exit()
+    if not os.access(sys.argv[1], os.R_OK):
+        print("file provided in argument does not have read permission")
+    regex_callbacks_dict = {}
+    config = configparser.ConfigParser()
+    config.read(sys.argv[1])
+    context = Context(config)
+    logging_level = logging.INFO
+    if config.getboolean('global','log_debug'):
+        logging_level = logging.DEBUG
+    try:
+        logging.basicConfig(
+        filename=config.get('global', 'log_file'),
+        level=logging_level,
+        format="%(asctime)s:%(levelname)s:%(message)s")
+    except configparser.NoOptionError as no_option_error:
+        print("'log_file' option does not exist in configuration file")
+    except configparser.NoSectionError as no_section_error:
+        print("'global' section does not exist in configuration file")
+    #below imap and smtp connection are created to just check imap connection 
+    #and login credentials
+
+    imap_conn = context.get_imap_connection()
+    context.get_smtp_connection()
+    mail_log_queue = queue.Queue()
+    source_folder = config.get('mailmove', 'source_folder')
+    destination_folder = config.get('mailmove', 'destination_folder')
+    typ1, msg = imap_conn.select(source_folder)
+    if typ1 == 'NO':
+        logging.debug("source folder {0} does not exists".format(source_folder))
+        print("source folder {0} does not exists".format(source_folder))
+        sys.exit()
+    typ2, msg = imap_conn.select(destination_folder)
+    if typ2 == 'NO':
+        imap_conn.create(destination_folder)
+        logging.debug("folder {0} is created".format(destination_folder))
+    try:
+        regex_callbacks = ast.literal_eval(config.get('global', 'regex_callbacks'))
+        event_handler = EventHandlerMailLog(config.get('global', 'config_file'))
+        path, log_file = os.path.split(config.get('global', 'config_file'))
+    except configparser.NoOptionError as option_error:
+        logging.error(option_error)
+        sys.exit()
+    except configparser.NoSectionError as no_section_error:
+        logging.error(no_section_error)
+        sys.exit()
+    observer = Observer()
+    observer.schedule(event_handler, path, recursive=False)
+    observer.start()
+    for regex_callback in regex_callbacks:
+        regex_callbacks_dict[re.compile(regex_callback[0])] = regex_callback[1]
+    t = threading.Thread(target = process_mail_log, args = [regex_callbacks_dict], daemon=True)
+    t.start()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
